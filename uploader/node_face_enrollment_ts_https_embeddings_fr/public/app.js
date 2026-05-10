@@ -1,0 +1,565 @@
+"use strict";
+const FACE_API_MODEL_URL = "https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model/";
+// Put this file in your web app public/models folder so it is served from this URL.
+// Use the same model as the Python attendance app:
+// models/face_recognition_sface_2021dec.onnx
+const SFACE_MODEL_URL = "/models/face_recognition_sface_2021dec.onnx";
+const ENROLLMENT_APP_BUILD = "sface-embeddings-only-2026-05-06";
+const UPLOAD_ACCEPTED_IMAGES = false; // embeddings-only mode: do NOT upload enrollment photos
+const video = document.getElementById("video");
+const canvas = document.getElementById("canvas");
+const startCameraBtn = document.getElementById("startCameraBtn");
+const captureBtn = document.getElementById("captureBtn");
+const stopCameraBtn = document.getElementById("stopCameraBtn");
+const studentIdInput = document.getElementById("studentId");
+const personNameInput = document.getElementById("personName");
+const statusEl = document.getElementById("status");
+const stepEl = document.getElementById("step");
+const previewsEl = document.getElementById("previews");
+let stream = null;
+let faceApiModelsLoaded = false;
+let sfaceSession = null;
+const CAPTURE_STEPS = [
+    { pose: "front", label: "Front", instruction: "Look straight at the camera.", isPoseOk: (q) => Math.abs(q.yaw) < 0.12 && Math.abs(q.pitch) < 0.12 },
+    { pose: "right", label: "Head right", instruction: "Turn your head slightly to YOUR right.", isPoseOk: (q) => q.yaw > 0.10 },
+    { pose: "left", label: "Head left", instruction: "Turn your head slightly to YOUR left.", isPoseOk: (q) => q.yaw < -0.10 },
+    { pose: "down", label: "Head down", instruction: "Tilt your head slightly down.", isPoseOk: (q) => q.pitch > 0.06 },
+    { pose: "front_2", label: "Front again", instruction: "Look straight again.", isPoseOk: (q) => Math.abs(q.yaw) < 0.12 && Math.abs(q.pitch) < 0.12 },
+];
+// OpenCV FaceRecognizerSF alignCrop uses these 5 target landmark positions and a 112x112 aligned face.
+const SFACE_SIZE = 112;
+const SFACE_REFERENCE_POINTS = [
+    { x: 38.2946, y: 51.6963 },
+    { x: 73.5318, y: 51.5014 },
+    { x: 56.0252, y: 71.7366 },
+    { x: 41.5493, y: 92.3655 },
+    { x: 70.7299, y: 92.2041 },
+];
+function setStatus(message) { statusEl.textContent = message; }
+function setStep(message) { stepEl.textContent = message; }
+function sleep(ms) { return new Promise((resolve) => window.setTimeout(resolve, ms)); }
+function installPoseTextOverlayOnly() {
+    // Only move the instruction/pose text (#step) over the camera preview.
+    // Do NOT move the buttons and do NOT move the status text.
+    if (!video || !stepEl)
+        return;
+    const host = video.parentElement;
+    if (!host)
+        return;
+    if (document.getElementById("poseTextOverlayOnlyStyles"))
+        return;
+    const style = document.createElement("style");
+    style.id = "poseTextOverlayOnlyStyles";
+    style.textContent = `
+    .pose-text-overlay-host {
+      position: relative !important;
+      overflow: hidden;
+    }
+
+    .pose-text-overlay-box {
+      position: absolute;
+      left: 12px;
+      right: 12px;
+      top: 10px;
+      z-index: 20;
+      pointer-events: none;
+      padding: 8px 10px;
+      border-radius: 12px;
+      background: rgba(2, 6, 23, 0.72);
+      border: 1px solid rgba(148, 163, 184, 0.35);
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
+      box-sizing: border-box;
+    }
+
+    .pose-text-overlay-box #step {
+      margin: 0 !important;
+      color: #ffffff !important;
+      font-size: 15px !important;
+      font-weight: 800 !important;
+      line-height: 1.25 !important;
+      text-align: center;
+      text-shadow: 0 1px 3px rgba(0, 0, 0, 0.85);
+    }
+  `;
+    document.head.appendChild(style);
+    host.classList.add("pose-text-overlay-host");
+    let overlay = document.getElementById("poseTextOverlayOnly");
+    if (!overlay) {
+        overlay = document.createElement("div");
+        overlay.id = "poseTextOverlayOnly";
+        overlay.className = "pose-text-overlay-box";
+        host.appendChild(overlay);
+    }
+    overlay.appendChild(stepEl);
+}
+function validateInputs() {
+    const studentId = studentIdInput.value.trim();
+    const personName = personNameInput.value.trim();
+    if (!studentId)
+        throw new Error("Student ID is required.");
+    if (!personName)
+        throw new Error("Person name is required.");
+    return { studentId, personName };
+}
+async function loadFaceApiModels() {
+    if (faceApiModelsLoaded)
+        return;
+    if (typeof faceapi === "undefined")
+        throw new Error("face-api library was not loaded.");
+    setStatus("Loading face detector and landmark models...");
+    await Promise.all([
+        faceapi.nets.tinyFaceDetector.loadFromUri(FACE_API_MODEL_URL),
+        faceapi.nets.faceLandmark68Net.loadFromUri(FACE_API_MODEL_URL),
+    ]);
+    faceApiModelsLoaded = true;
+}
+async function loadSFaceModel() {
+    if (sfaceSession)
+        return;
+    if (typeof ort === "undefined")
+        throw new Error("onnxruntime-web was not loaded. Add ort.min.js in index.html.");
+    // Needed when using the CDN script for onnxruntime-web.
+    // Remove or change this if you bundle onnxruntime-web locally.
+    ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/";
+    setStatus("Loading OpenCV SFace ONNX model...");
+    sfaceSession = await ort.InferenceSession.create(SFACE_MODEL_URL, {
+        executionProviders: ["wasm"],
+    });
+}
+async function loadModels() {
+    await loadFaceApiModels();
+    await loadSFaceModel();
+}
+async function startCamera() {
+    try {
+        if (!navigator.mediaDevices?.getUserMedia)
+            throw new Error("Camera API is not available. Use HTTPS or localhost.");
+        await loadModels();
+        stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+        video.srcObject = stream;
+        startCameraBtn.disabled = true;
+        captureBtn.disabled = false;
+        stopCameraBtn.disabled = false;
+        setStatus(`Camera started. SFace embeddings-only build: ${ENROLLMENT_APP_BUILD}. Put your face inside the green contour.`);
+    }
+    catch (err) {
+        const error = err;
+        console.error(error);
+        setStatus(`Camera error: ${error.name}: ${error.message}`);
+    }
+}
+function stopCamera() {
+    if (stream)
+        for (const track of stream.getTracks())
+            track.stop();
+    stream = null;
+    video.srcObject = null;
+    startCameraBtn.disabled = false;
+    captureBtn.disabled = true;
+    stopCameraBtn.disabled = true;
+    setStatus("Camera stopped.");
+}
+function getDetectionOptions() {
+    return new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.5 });
+}
+async function detectFace() {
+    if (!video.videoWidth || !video.videoHeight || !faceApiModelsLoaded)
+        return null;
+    // Keep face-api only for detection + 68 landmarks + quality/pose checks.
+    // The actual recognition descriptor below is OpenCV SFace, not face-api.
+    return await faceapi.detectSingleFace(video, getDetectionOptions()).withFaceLandmarks();
+}
+function averagePoint(points) {
+    const sum = points.reduce((acc, p) => ({ x: acc.x + p.x, y: acc.y + p.y }), { x: 0, y: 0 });
+    return { x: sum.x / points.length, y: sum.y / points.length };
+}
+function getSFaceSourcePoints(result) {
+    const landmarks = result.landmarks;
+    const leftEye = averagePoint(landmarks.getLeftEye());
+    const rightEye = averagePoint(landmarks.getRightEye());
+    const nose = landmarks.getNose()[3] || landmarks.getNose()[0];
+    const mouth = landmarks.getMouth();
+    const leftMouth = mouth[0];
+    const rightMouth = mouth[6];
+    return [leftEye, rightEye, nose, leftMouth, rightMouth];
+}
+function estimatePose(result) {
+    const landmarks = result.landmarks;
+    const leftEye = averagePoint(landmarks.getLeftEye());
+    const rightEye = averagePoint(landmarks.getRightEye());
+    const nose = landmarks.getNose()[3] || landmarks.getNose()[0];
+    const mouth = averagePoint(landmarks.getMouth());
+    const eyeMid = { x: (leftEye.x + rightEye.x) / 2, y: (leftEye.y + rightEye.y) / 2 };
+    const eyeDistance = Math.max(1, Math.hypot(rightEye.x - leftEye.x, rightEye.y - leftEye.y));
+    const vertical = Math.max(1, mouth.y - eyeMid.y);
+    const yaw = (nose.x - eyeMid.x) / eyeDistance;
+    const pitch = (nose.y - eyeMid.y) / vertical - 0.48;
+    return { yaw, pitch };
+}
+function captureCurrentFrame() {
+    if (!video.videoWidth || !video.videoHeight)
+        throw new Error("Video is not ready yet.");
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    const ctx = canvas.getContext("2d");
+    if (!ctx)
+        throw new Error("Could not create canvas context.");
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    return canvas;
+}
+function getImageDataForBox(sourceCanvas, box) {
+    const ctx = sourceCanvas.getContext("2d");
+    if (!ctx)
+        throw new Error("Could not create canvas context.");
+    const x = Math.max(0, Math.floor(box.x));
+    const y = Math.max(0, Math.floor(box.y));
+    const width = Math.max(1, Math.min(sourceCanvas.width - x, Math.floor(box.width)));
+    const height = Math.max(1, Math.min(sourceCanvas.height - y, Math.floor(box.height)));
+    return ctx.getImageData(x, y, width, height);
+}
+function brightnessScore(imageData) {
+    const data = imageData.data;
+    let total = 0;
+    const pixels = data.length / 4;
+    for (let i = 0; i < data.length; i += 4)
+        total += 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+    return total / pixels;
+}
+function blurScore(imageData) {
+    const { width, height, data } = imageData;
+    if (width < 3 || height < 3)
+        return 0;
+    const gray = new Float32Array(width * height);
+    for (let i = 0, j = 0; i < data.length; i += 4, j++)
+        gray[j] = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+    let sum = 0, sumSq = 0, count = 0;
+    for (let y = 1; y < height - 1; y++) {
+        for (let x = 1; x < width - 1; x++) {
+            const idx = y * width + x;
+            const lap = 4 * gray[idx] - gray[idx - 1] - gray[idx + 1] - gray[idx - width] - gray[idx + width];
+            sum += lap;
+            sumSq += lap * lap;
+            count++;
+        }
+    }
+    const mean = sum / count;
+    return sumSq / count - mean * mean;
+}
+function isFaceCentered(box, frameWidth, frameHeight) {
+    const centerX = box.x + box.width / 2;
+    const centerY = box.y + box.height / 2;
+    return centerX >= frameWidth * 0.24 && centerX <= frameWidth * 0.76 && centerY >= frameHeight * 0.15 && centerY <= frameHeight * 0.85;
+}
+function evaluateQuality(result) {
+    const frameCanvas = captureCurrentFrame();
+    const box = result.detection.box;
+    const faceImage = getImageDataForBox(frameCanvas, box);
+    const pose = estimatePose(result);
+    return {
+        score: result.detection.score,
+        blur: blurScore(faceImage),
+        brightness: brightnessScore(faceImage),
+        faceHeightRatio: box.height / frameCanvas.height,
+        centered: isFaceCentered(box, frameCanvas.width, frameCanvas.height),
+        yaw: pose.yaw,
+        pitch: pose.pitch,
+    };
+}
+function isQualityOk(q) {
+    return q.score >= 0.5 && q.blur >= 45 && q.brightness >= 45 && q.brightness <= 225 && q.faceHeightRatio >= 0.18 && q.faceHeightRatio <= 0.70 && q.centered;
+}
+function qualityMessage(q) {
+    if (q.blur < 45)
+        return "Image is blurry. Hold the phone steady.";
+    if (q.brightness < 45)
+        return "Image is too dark. Add light.";
+    if (q.brightness > 225)
+        return "Image is too bright.";
+    if (q.faceHeightRatio < 0.18)
+        return "Move closer.";
+    if (q.faceHeightRatio > 0.70)
+        return "Move slightly farther.";
+    if (!q.centered)
+        return "Center your face inside the green contour.";
+    return "Good image.";
+}
+function getSimilarityTransform(src, dst) {
+    if (src.length !== 5 || dst.length !== 5)
+        throw new Error("SFace alignment needs exactly 5 landmarks.");
+    const srcMean = averagePoint(src);
+    const dstMean = averagePoint(dst);
+    let den = 0;
+    let aNum = 0;
+    let bNum = 0;
+    for (let i = 0; i < src.length; i++) {
+        const sx = src[i].x - srcMean.x;
+        const sy = src[i].y - srcMean.y;
+        const dx = dst[i].x - dstMean.x;
+        const dy = dst[i].y - dstMean.y;
+        den += sx * sx + sy * sy;
+        aNum += sx * dx + sy * dy;
+        bNum += sx * dy - sy * dx;
+    }
+    if (den <= 1e-6)
+        throw new Error("Invalid face landmarks for SFace alignment.");
+    const a = aNum / den;
+    const b = bNum / den;
+    const c = -b;
+    const d = a;
+    const e = dstMean.x - a * srcMean.x - c * srcMean.y;
+    const f = dstMean.y - b * srcMean.x - d * srcMean.y;
+    // Canvas setTransform(a, b, c, d, e, f):
+    // x' = a*x + c*y + e
+    // y' = b*x + d*y + f
+    return [a, b, c, d, e, f];
+}
+function alignFaceForSFace(sourceCanvas, result) {
+    const srcPoints = getSFaceSourcePoints(result);
+    const [a, b, c, d, e, f] = getSimilarityTransform(srcPoints, SFACE_REFERENCE_POINTS);
+    const alignedCanvas = document.createElement("canvas");
+    alignedCanvas.width = SFACE_SIZE;
+    alignedCanvas.height = SFACE_SIZE;
+    const ctx = alignedCanvas.getContext("2d");
+    if (!ctx)
+        throw new Error("Could not create aligned face canvas context.");
+    ctx.setTransform(a, b, c, d, e, f);
+    ctx.drawImage(sourceCanvas, 0, 0);
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    return alignedCanvas;
+}
+function canvasToSFaceInputTensor(alignedCanvas) {
+    const ctx = alignedCanvas.getContext("2d");
+    if (!ctx)
+        throw new Error("Could not create aligned face canvas context.");
+    const imageData = ctx.getImageData(0, 0, SFACE_SIZE, SFACE_SIZE).data;
+    const chw = new Float32Array(1 * 3 * SFACE_SIZE * SFACE_SIZE);
+    const planeSize = SFACE_SIZE * SFACE_SIZE;
+    for (let y = 0; y < SFACE_SIZE; y++) {
+        for (let x = 0; x < SFACE_SIZE; x++) {
+            const srcIdx = (y * SFACE_SIZE + x) * 4;
+            const dstIdx = y * SFACE_SIZE + x;
+            // OpenCV FaceRecognizerSF uses blobFromImage(..., scalefactor=1, mean=0, swapRB=true).
+            // Since canvas is already RGB, feed RGB channels, values 0..255, CHW layout.
+            chw[dstIdx] = imageData[srcIdx];
+            chw[planeSize + dstIdx] = imageData[srcIdx + 1];
+            chw[2 * planeSize + dstIdx] = imageData[srcIdx + 2];
+        }
+    }
+    return new ort.Tensor("float32", chw, [1, 3, SFACE_SIZE, SFACE_SIZE]);
+}
+function l2Normalize(values) {
+    let sumSq = 0;
+    for (const v of values)
+        sumSq += v * v;
+    const norm = Math.sqrt(sumSq);
+    if (!Number.isFinite(norm) || norm <= 1e-12)
+        return values;
+    return values.map((v) => v / norm);
+}
+async function extractSFaceDescriptor(frameCanvas, result) {
+    if (!sfaceSession)
+        throw new Error("SFace ONNX session is not loaded.");
+    const alignedCanvas = alignFaceForSFace(frameCanvas, result);
+    const inputTensor = canvasToSFaceInputTensor(alignedCanvas);
+    const inputName = sfaceSession.inputNames[0];
+    const outputName = sfaceSession.outputNames[0];
+    const outputs = await sfaceSession.run({ [inputName]: inputTensor });
+    const output = outputs[outputName];
+    const raw = Array.from(output.data);
+    if (raw.length !== 128)
+        throw new Error(`SFace descriptor length is ${raw.length}, expected 128.`);
+    return l2Normalize(raw);
+}
+function canvasToBlob(sourceCanvas) {
+    return new Promise((resolve, reject) => {
+        sourceCanvas.toBlob((blob) => {
+            if (!blob)
+                return reject(new Error("Could not create image blob."));
+            resolve(blob);
+        }, "image/jpeg", 0.92);
+    });
+}
+async function uploadImage(blob, frameIndex, pose) {
+    const { studentId, personName } = validateInputs();
+    const formData = new FormData();
+    formData.append("studentId", studentId);
+    formData.append("name", personName);
+    formData.append("frameIndex", String(frameIndex));
+    formData.append("pose", pose);
+    formData.append("image", blob, `${pose}_${frameIndex}.jpg`);
+    const response = await fetch("/api/upload-face", { method: "POST", body: formData });
+    const data = await response.json().catch(() => null);
+    if (!response.ok || !data?.ok)
+        throw new Error(data?.error || `Image upload failed with status ${response.status}`);
+}
+function descriptorNorm(values) {
+    let sumSq = 0;
+    for (const value of values)
+        sumSq += value * value;
+    return Math.sqrt(sumSq);
+}
+function buildSFacePayload(studentId, personName, embeddings) {
+    return {
+        version: 2,
+        studentId,
+        name: personName,
+        createdAt: new Date().toISOString(),
+        model: {
+            family: "opencv",
+            detectorForEnrollment: "@vladmandic/face-api tinyFaceDetector + faceLandmark68Net",
+            recognizer: "sface",
+            recognizerModel: "face_recognition_sface_2021dec.onnx",
+            descriptorLength: 128,
+            descriptorNormalized: true,
+            alignedSize: [SFACE_SIZE, SFACE_SIZE],
+            clientBuild: ENROLLMENT_APP_BUILD,
+            note: "Embeddings-only enrollment. Descriptors are generated with OpenCV SFace ONNX in the browser using ONNX Runtime Web. Do not compare these with face-api faceRecognitionNet descriptors.",
+        },
+        captures: embeddings,
+    };
+}
+function assertValidSFacePayload(payload) {
+    if (payload.model.family.toLowerCase() !== "opencv") {
+        throw new Error(`Internal error: wrong embedding family '${payload.model.family}'. Expected opencv.`);
+    }
+    if (payload.model.recognizer.toLowerCase() !== "sface") {
+        throw new Error(`Internal error: wrong recognizer '${payload.model.recognizer}'. Expected sface.`);
+    }
+    if (!Array.isArray(payload.captures) || payload.captures.length === 0) {
+        throw new Error("No embeddings were captured.");
+    }
+    for (const capture of payload.captures) {
+        if (!Array.isArray(capture.descriptor) || capture.descriptor.length !== 128) {
+            throw new Error(`Invalid SFace descriptor for '${capture.label}': expected 128 numbers.`);
+        }
+        if (!capture.descriptor.every((value) => Number.isFinite(value))) {
+            throw new Error(`Invalid SFace descriptor for '${capture.label}': descriptor contains non-finite values.`);
+        }
+        const norm = descriptorNorm(capture.descriptor);
+        if (Math.abs(norm - 1.0) > 0.05) {
+            throw new Error(`Invalid SFace descriptor for '${capture.label}': expected L2 norm close to 1.0, got ${norm.toFixed(4)}.`);
+        }
+    }
+}
+async function uploadEmbeddingFile(embeddings) {
+    const { studentId, personName } = validateInputs();
+    const payload = buildSFacePayload(studentId, personName, embeddings);
+    assertValidSFacePayload(payload);
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const formData = new FormData();
+    formData.append("studentId", studentId);
+    formData.append("name", personName);
+    formData.append("model", "opencv-sface-2021dec");
+    formData.append("clientBuild", ENROLLMENT_APP_BUILD);
+    formData.append("embeddingFile", blob, `${personName}_${studentId}_sface_embeddings.json`);
+    const response = await fetch("/api/upload-embedding-file", { method: "POST", body: formData });
+    const data = await response.json().catch(() => null);
+    if (!response.ok || !data?.ok)
+        throw new Error(data?.error || `Embedding upload failed with status ${response.status}`);
+}
+async function completeEnrollment() {
+    const { studentId, personName } = validateInputs();
+    const response = await fetch("/api/complete-enrollment", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ studentId, name: personName }),
+    });
+    if (!response.ok)
+        throw new Error(`Complete enrollment failed with status ${response.status}`);
+    return await response.json();
+}
+function addPreview(blob, label) {
+    const wrapper = document.createElement("div");
+    wrapper.className = "preview-item";
+    const img = document.createElement("img");
+    img.src = URL.createObjectURL(blob);
+    const caption = document.createElement("span");
+    caption.textContent = label;
+    wrapper.appendChild(img);
+    wrapper.appendChild(caption);
+    previewsEl.prepend(wrapper);
+}
+async function captureStep(step, stepIndex) {
+    const { studentId, personName } = validateInputs();
+    setStep(`${step.label}: ${step.instruction}`);
+    const timeoutAt = Date.now() + 20000;
+    let stableGoodFrames = 0;
+    let lastResult = null;
+    let lastQuality = null;
+    while (Date.now() < timeoutAt) {
+        const result = await detectFace();
+        if (!result) {
+            stableGoodFrames = 0;
+            setStatus("No face detected. Put your face inside the contour.");
+            await sleep(150);
+            continue;
+        }
+        const quality = evaluateQuality(result);
+        const qualityOk = isQualityOk(quality);
+        const poseOk = step.isPoseOk(quality);
+        if (qualityOk && poseOk) {
+            stableGoodFrames++;
+            setStatus(`Good. Hold still... ${stableGoodFrames}/3`);
+        }
+        else {
+            stableGoodFrames = 0;
+            setStatus(!qualityOk ? qualityMessage(quality) : step.instruction);
+        }
+        lastResult = result;
+        lastQuality = quality;
+        if (stableGoodFrames >= 3)
+            break;
+        await sleep(160);
+    }
+    if (!lastResult || !lastQuality || stableGoodFrames < 3)
+        throw new Error(`Could not capture a clear image for: ${step.label}`);
+    const frameCanvas = captureCurrentFrame();
+    const imageBlob = await canvasToBlob(frameCanvas);
+    addPreview(imageBlob, step.label);
+    if (UPLOAD_ACCEPTED_IMAGES)
+        await uploadImage(imageBlob, stepIndex + 1, step.pose);
+    setStatus(`Generating SFace embedding for ${step.label}...`);
+    const descriptor = await extractSFaceDescriptor(frameCanvas, lastResult);
+    return {
+        studentId,
+        name: personName,
+        pose: step.pose,
+        label: step.label,
+        descriptor,
+        quality: lastQuality,
+        capturedAt: new Date().toISOString(),
+    };
+}
+async function captureEnrollment() {
+    captureBtn.disabled = true;
+    previewsEl.innerHTML = "";
+    try {
+        validateInputs();
+        await loadModels();
+        const embeddings = [];
+        for (let i = 0; i < CAPTURE_STEPS.length; i++) {
+            const embedding = await captureStep(CAPTURE_STEPS[i], i);
+            embeddings.push(embedding);
+            await sleep(500);
+        }
+        setStep("Uploading SFace embedding file...");
+        setStatus(`Uploading one JSON file with all local SFace embeddings. Build: ${ENROLLMENT_APP_BUILD}`);
+        await uploadEmbeddingFile(embeddings);
+        const summary = await completeEnrollment();
+        setStep("Enrollment complete.");
+        setStatus(`Done. Images: ${summary.savedImages}, embedding files: ${summary.savedEmbeddingFiles}. Saved to: ${summary.uploadDir}`);
+    }
+    catch (err) {
+        const error = err;
+        console.error(error);
+        setStatus(`Error: ${error.message}`);
+    }
+    finally {
+        captureBtn.disabled = false;
+    }
+}
+installPoseTextOverlayOnly();
+startCameraBtn.addEventListener("click", () => void startCamera());
+stopCameraBtn.addEventListener("click", stopCamera);
+captureBtn.addEventListener("click", () => void captureEnrollment());

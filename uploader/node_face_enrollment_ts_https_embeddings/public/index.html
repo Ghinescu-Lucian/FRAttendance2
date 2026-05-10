@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Face Enrollment Local Embeddings</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="/styles.css" />
+  <script defer src="https://cdn.jsdelivr.net/npm/@vladmandic/face-api/dist/face-api.min.js"></script>
+  <script defer src="/app.js"></script>
+</head>
+<body>
+  <main class="page">
+    <section class="panel">
+      <h1>Face Enrollment</h1>
+      <p class="subtitle">The phone creates face embeddings locally and uploads one JSON file.</p>
+      <div class="form-grid">
+        <label>Student ID<input id="studentId" value="123" autocomplete="off" /></label>
+        <label>Person name<input id="personName" value="GhinescuLucian" autocomplete="off" /></label>
+      </div>
+      <div class="camera-card">
+        <video id="video" autoplay playsinline muted></video>
+        <div class="face-contour">
+          <div class="corner top-left"></div><div class="corner top-right"></div>
+          <div class="corner bottom-left"></div><div class="corner bottom-right"></div>
+        </div>
+      </div>
+      <p id="step" class="step">Start the camera, then follow the pose instructions.</p>
+      <div class="buttons">
+        <button id="startCameraBtn">Start camera</button>
+        <button id="captureBtn" disabled>Capture local embeddings</button>
+        <button id="stopCameraBtn" disabled>Stop camera</button>
+      </div>
+      <p id="status" class="status">Camera not started.</p>
+      <h2>Accepted captures</h2>
+      <div id="previews" class="previews"></div>
+    </section>
+  </main>
+  <canvas id="canvas" hidden></canvas>
+</body>
+</html>

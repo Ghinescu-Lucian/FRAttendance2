@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Phone Face Recognition</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="/styles.css" />
+  <script defer src="https://cdn.jsdelivr.net/npm/@vladmandic/face-api/dist/face-api.min.js"></script>
+  <script defer src="/recognize.js"></script>
+</head>
+<body>
+  <main class="page">
+    <section class="panel">
+      <h1>Phone Face Recognition</h1>
+      <p class="subtitle">
+        This page loads the saved browser embeddings and performs recognition locally on the phone.
+      </p>
+
+      <div class="camera-card">
+        <video id="video" autoplay playsinline muted></video>
+        <div class="face-contour">
+          <div class="corner top-left"></div>
+          <div class="corner top-right"></div>
+          <div class="corner bottom-left"></div>
+          <div class="corner bottom-right"></div>
+        </div>
+      </div>
+
+      <div class="buttons">
+        <button id="startCameraBtn">Start recognition</button>
+        <button id="reloadBtn">Reload embeddings</button>
+        <button id="stopCameraBtn" disabled>Stop camera</button>
+        <a class="link-button" href="/">Enrollment page</a>
+      </div>
+
+      <p id="status" class="status">Recognition not started.</p>
+
+      <div id="resultBox" class="result-box unknown">
+        <div class="result-name">Unknown</div>
+        <div id="resultDetails" class="result-details">No face detected yet.</div>
+      </div>
+
+      <h2>Loaded people</h2>
+      <div id="peopleList" class="people-list"></div>
+    </section>
+  </main>
+</body>
+</html>

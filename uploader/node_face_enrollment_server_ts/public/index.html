@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Face Enrollment Upload</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <main class="page">
+    <section class="panel">
+      <h1>Face Enrollment</h1>
+      <p class="subtitle">
+        Place your face inside the green contour, then capture several photos.
+      </p>
+
+      <div class="form-grid">
+        <label>
+          Student ID
+          <input id="studentId" value="123" autocomplete="off" />
+        </label>
+
+        <label>
+          Person name
+          <input id="personName" value="GhinescuLucian" autocomplete="off" />
+        </label>
+
+        <label>
+          Photos
+          <input id="photoCount" type="number" min="1" max="10" value="5" />
+        </label>
+      </div>
+
+      <div class="camera-card">
+        <video id="video" autoplay playsinline muted></video>
+
+        <div class="face-contour">
+          <div class="corner top-left"></div>
+          <div class="corner top-right"></div>
+          <div class="corner bottom-left"></div>
+          <div class="corner bottom-right"></div>
+        </div>
+
+        <div id="countdown" class="countdown"></div>
+      </div>
+
+      <div class="buttons">
+        <button id="startCameraBtn">Start camera</button>
+        <button id="captureBtn" disabled>Capture and upload</button>
+        <button id="stopCameraBtn" disabled>Stop camera</button>
+      </div>
+
+      <p id="status" class="status">Camera not started.</p>
+
+      <h2>Captured previews</h2>
+      <div id="previews" class="previews"></div>
+    </section>
+  </main>
+
+  <canvas id="canvas" hidden></canvas>
+
+  <script src="/app.js"></script>
+</body>
+</html>
