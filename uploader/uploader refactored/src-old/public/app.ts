@@ -1,0 +1,26 @@
+import { EnrollmentApi } from "./api/enrollmentApi.js";
+import { EnrollmentController } from "./controllers.js";
+import { CameraService } from "./services/cameraService.js";
+import { FaceDetectionService } from "./services/faceDetectionService.js";
+import { InputService } from "./services/inputService.js";
+import { QualityService } from "./services/qualityService.js";
+import { SFaceEmbeddingService } from "./services/sfaceEmbeddingService.js";
+import { SpeechService } from "./services/speechService.js";
+import { EnrollmentView } from "./ui/dom.js";
+import { installPoseTextOverlayOnly } from "./ui/poseOverlay.js";
+
+const view = new EnrollmentView();
+installPoseTextOverlayOnly(view);
+
+const controller = new EnrollmentController(
+  view,
+  new InputService(view),
+  new CameraService(view.video),
+  new FaceDetectionService(),
+  new QualityService(),
+  new SFaceEmbeddingService(),
+  new EnrollmentApi(),
+  new SpeechService(),
+);
+
+controller.bind();
