@@ -1,0 +1,5 @@
+deepface
+tensorflow[and-cuda]
+tf-keras
+opencv-python
+numpy

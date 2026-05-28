@@ -1,0 +1,19 @@
+{
+  "moodle_base_url": "https://192.168.0.154",
+  "cmid": 20,
+  "api_secret": "1234",
+  "verify_tls": false,
+  "camera_index": 0,
+  "profile": "fast_short",
+  "source": "camera-lab-1",
+  "refresh_seconds": 30,
+  "unknown_cooldown_seconds": 15,
+  "http_timeout_seconds": 10,
+  "manual_zoom_enabled": false,
+  "manual_zoom": 1.0,
+  "manual_zoom_max": 15.0,
+  "manual_zoom_center_x": 0.5,
+  "manual_zoom_center_y": 0.5,
+  "manual_zoom_step": 0.25,
+  "manual_zoom_pan_step": 0.06
+}

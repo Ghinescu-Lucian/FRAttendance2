@@ -1,0 +1,12 @@
+{
+  "moodle_base_url": "https://192.168.0.154",
+  "cmid": 20,
+  "api_secret": "1234",
+  "verify_tls": false,
+  "camera_index": 0,
+  "profile": "fast_short",
+  "source": "camera-lab-1",
+  "refresh_seconds": 30,
+  "unknown_cooldown_seconds": 15,
+  "http_timeout_seconds": 10
+}
