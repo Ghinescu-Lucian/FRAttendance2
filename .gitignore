@@ -4,3 +4,4 @@ Face Recognition ex/captures/
 Face Recognition ex/captures_Old/
 # Ignore node_modules only inside uploader
 uploader/**/node_modules/
+*.zip
