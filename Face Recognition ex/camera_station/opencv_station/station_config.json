@@ -1,6 +1,6 @@
 {
-  "moodle_base_url": "https://192.168.0.154",
-  "cmid": 20,
+  "moodle_base_url": "https://192.168.1.8",
+  "cmid": 21,
   "api_secret": "1234",
   "verify_tls": false,
   "camera_index": 0,

@@ -423,6 +423,149 @@ class RuntimeOptions:
     use_moodle: bool
     camera_width: int = 1280
     camera_height: int = 720
+    stream_max_width: int = 960
+
+
+class ResilientNetworkCapture:
+    """Latest-frame RTSP/HTTP/video-file reader with reconnect support.
+
+    OpenCV's VideoCapture.read() can block for a long time on RTSP streams.
+    This wrapper keeps the blocking read in a daemon thread. The recognition
+    worker receives only the newest fresh frame, so old buffered frames are
+    dropped instead of being processed seconds late.
+    """
+
+    def __init__(self, source: str, status_callback=None, stale_seconds: float = 2.5):
+        self.source = str(source or "").strip()
+        self.status_callback = status_callback
+        self.stale_seconds = float(stale_seconds)
+        self._stop_event = threading.Event()
+        self._frame_lock = threading.RLock()
+        self._last_frame = None
+        self._last_frame_time = 0.0
+        self._last_frame_id = 0
+        self._last_consumed_id = 0
+        self._cap = None
+        self._last_status_time = 0.0
+        self._open_attempts = 0
+        self._thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self._thread.start()
+
+    def _status(self, text: str, min_interval: float = 1.5) -> None:
+        if self.status_callback is None:
+            return
+        now = time.time()
+        if now - self._last_status_time < min_interval:
+            return
+        self._last_status_time = now
+        try:
+            self.status_callback(text)
+        except Exception:
+            pass
+
+    def _configure_ffmpeg_options(self) -> None:
+        # Advanced override for special cameras. If the user set the variable, do not replace it.
+        if os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS"):
+            return
+        if self.source.lower().startswith("rtsp://"):
+            # Lower latency and a finite timeout. TCP is usually more stable for Hikvision/HiLook LAN cameras.
+            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+                "rtsp_transport;tcp|stimeout;5000000|max_delay;500000|fflags;nobuffer|flags;low_delay"
+            )
+
+    def _open_once(self):
+        self._configure_ffmpeg_options()
+        cap = cv2.VideoCapture(self.source, cv2.CAP_FFMPEG)
+        if not cap.isOpened():
+            try:
+                cap.release()
+            except Exception:
+                pass
+            cap = cv2.VideoCapture(self.source)
+        try:
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
+        return cap
+
+    def _sleep_interruptible(self, seconds: float) -> None:
+        end = time.time() + max(0.0, seconds)
+        while not self._stop_event.is_set() and time.time() < end:
+            time.sleep(min(0.05, end - time.time()))
+
+    def _reader_loop(self) -> None:
+        reconnect_delay = 0.5
+        while not self._stop_event.is_set():
+            self._open_attempts += 1
+            self._status("Connecting network stream...")
+            cap = self._open_once()
+            self._cap = cap
+
+            if not cap.isOpened():
+                self._status("Network stream could not be opened. Retrying...")
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+                self._sleep_interruptible(min(5.0, reconnect_delay))
+                reconnect_delay = min(5.0, reconnect_delay * 1.5)
+                continue
+
+            self._status("Network stream connected")
+            reconnect_delay = 0.5
+            failures = 0
+
+            while not self._stop_event.is_set():
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    failures += 1
+                    if failures >= 5:
+                        self._status("Network stream lost. Reconnecting...")
+                        break
+                    self._sleep_interruptible(0.02)
+                    continue
+
+                failures = 0
+                with self._frame_lock:
+                    self._last_frame = frame
+                    self._last_frame_time = time.time()
+                    self._last_frame_id += 1
+
+            try:
+                cap.release()
+            except Exception:
+                pass
+            self._cap = None
+            self._sleep_interruptible(min(3.0, reconnect_delay))
+            reconnect_delay = min(5.0, reconnect_delay * 1.3)
+
+    def isOpened(self) -> bool:
+        # The wrapper is usable while its reader thread is alive; the first frame may arrive a moment later.
+        return self._thread.is_alive() and not self._stop_event.is_set()
+
+    def read(self):
+        with self._frame_lock:
+            if self._last_frame is None:
+                return False, None
+            age = time.time() - self._last_frame_time
+            if age > self.stale_seconds:
+                self._status("Waiting for fresh network frames / reconnecting...")
+                return False, None
+            if self._last_frame_id == self._last_consumed_id:
+                # Do not process the same RTSP frame repeatedly.
+                return False, None
+            self._last_consumed_id = self._last_frame_id
+            return True, self._last_frame.copy()
+
+    def release(self) -> None:
+        self._stop_event.set()
+        try:
+            if self._cap is not None:
+                self._cap.release()
+        except Exception:
+            pass
+        if self._thread.is_alive():
+            self._thread.join(timeout=1.0)
 
 
 class StationWorker(threading.Thread):
@@ -442,6 +585,7 @@ class StationWorker(threading.Thread):
             "draw_unknown": True,
             "grid_search": False,
         }
+        self.controls_version = 0
         self.known_features_lock = threading.RLock()
         self.known_features: Dict[str, List[np.ndarray]] = {}
         self.known_report: Dict[str, dict] = {}
@@ -450,7 +594,13 @@ class StationWorker(threading.Thread):
 
     def update_controls(self, **kwargs) -> None:
         with self.controls_lock:
-            self.controls.update(kwargs)
+            changed = False
+            for key, value in kwargs.items():
+                if self.controls.get(key) != value:
+                    changed = True
+                self.controls[key] = value
+            if changed:
+                self.controls_version += 1
 
     def register_known(self, label: str, descriptors: List[np.ndarray]) -> None:
         with self.known_features_lock:
@@ -499,16 +649,9 @@ class StationWorker(threading.Thread):
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             return cap
 
-        # RTSP/HTTP stream or local video file.
-        cap = cv2.VideoCapture(source_value, cv2.CAP_FFMPEG)
-        if not cap.isOpened():
-            cap.release()
-            cap = cv2.VideoCapture(source_value)
-        try:
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        except Exception:
-            pass
-        return cap
+        # RTSP/HTTP stream or local video file. Use a threaded latest-frame reader
+        # so the main recognition loop never blocks inside VideoCapture.read().
+        return ResilientNetworkCapture(source_value, status_callback=lambda text: self._status(text))
 
     def _load_known_features(self, detector, recognizer) -> Dict[str, List[np.ndarray]]:
         if self.options.use_moodle:
@@ -519,16 +662,35 @@ class StationWorker(threading.Thread):
         station.EMBEDDINGS_SOURCE = self.options.embeddings_source or station.EMBEDDINGS_SOURCE
         return station.load_known_features_from_embeddings(station.EMBEDDINGS_SOURCE)
 
-    def _update_station_controls(self) -> None:
+    def _update_station_controls(self) -> Tuple[dict, int]:
         with self.controls_lock:
             controls = dict(self.controls)
+            version = int(self.controls_version)
 
-        station.MANUAL_ZOOM_ENABLED = bool(controls.get("zoom_enabled"))
-        station.MANUAL_ZOOM_FACTOR = float(controls.get("zoom_factor", 1.0))
+        zoom_factor = max(1.0, float(controls.get("zoom_factor", 1.0)))
+        zoom_enabled = bool(controls.get("zoom_enabled")) and zoom_factor > 1.001
+
+        # The desktop UI goes to 8x. Keep the station-side clamp in sync;
+        # otherwise values above the old default max are silently clamped.
+        station.MANUAL_ZOOM_MAX = max(float(getattr(station, "MANUAL_ZOOM_MAX", 5.0)), 8.0)
+        station.MANUAL_ZOOM_ENABLED = zoom_enabled
+        station.MANUAL_ZOOM_FACTOR = zoom_factor
         station.MANUAL_ZOOM_CENTER_X = float(controls.get("zoom_center_x", 0.5))
         station.MANUAL_ZOOM_CENTER_Y = float(controls.get("zoom_center_y", 0.5))
         station.DRAW_UNKNOWN_FACES = bool(controls.get("draw_unknown", True))
         station.ENABLE_PERIODIC_GRID_SEARCH = bool(controls.get("grid_search", False))
+        return controls, version
+
+    def _resize_stream_frame_for_processing(self, frame: np.ndarray) -> np.ndarray:
+        if self.options.source_kind != "stream":
+            return frame
+        max_width = max(320, int(getattr(self.options, "stream_max_width", 960) or 960))
+        h, w = frame.shape[:2]
+        if w <= max_width:
+            return frame
+        scale = max_width / float(w)
+        new_size = (max_width, max(1, int(round(h * scale))))
+        return cv2.resize(frame, new_size, interpolation=cv2.INTER_AREA)
 
     def _draw_candidates(self, display_frame: np.ndarray, candidates: List[dict], face_state_by_name: dict) -> None:
         h, w = display_frame.shape[:2]
@@ -600,17 +762,26 @@ class StationWorker(threading.Thread):
             last_attendance_time_by_name = {}
             frame_index = 0
             last_candidates: List[dict] = []
+            last_controls_version = -1
             last_fps_time = time.time()
             frames_since_fps = 0
 
             while not self.stop_event.is_set():
                 ok, frame = self.cap.read()
                 if not ok or frame is None:
-                    time.sleep(0.04)
+                    time.sleep(0.01)
                     continue
 
-                self._update_station_controls()
+                frame = self._resize_stream_frame_for_processing(frame)
+
+                _controls, controls_version = self._update_station_controls()
+                if controls_version != last_controls_version:
+                    # Old boxes were computed in the previous zoom/crop coordinate space.
+                    last_candidates = []
+                    last_controls_version = controls_version
+
                 frame, _manual_zoom_crop = station.apply_manual_station_zoom(frame)
+                zoom_status = station.manual_zoom_status_text()
 
                 now = time.time()
                 frame_index += 1
@@ -699,6 +870,10 @@ class StationWorker(threading.Thread):
                 known_count = sum(1 for c in candidates if c.get("is_known", False))
                 unknown_count = len(candidates) - known_count
                 status = f"FPS {self.fps:.1f} | faces {len(candidates)} | known {known_count} | unknown {unknown_count} | {backend_label}"
+                if zoom_status != "zoom OFF":
+                    status += f" | {zoom_status}"
+                if self.options.source_kind == "stream":
+                    status += f" | proc {display_frame.shape[1]}x{display_frame.shape[0]}"
                 cv2.putText(display_frame, status, (18, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
 
                 meta = {
@@ -707,6 +882,7 @@ class StationWorker(threading.Thread):
                     "unknown_count": unknown_count,
                     "total_faces": len(candidates),
                     "backend": backend_label,
+                    "zoom_status": zoom_status,
                     "known_report": list(self.known_report.values()),
                     "unknown_report": self.registry.snapshot(),
                 }
@@ -843,11 +1019,13 @@ class DesktopStationApp(tk.Tk):
         ttk.Label(side, text="Digital zoom", style="Card.TLabel", font=("Segoe UI Semibold", 12)).grid(row=12, column=0, columnspan=3, sticky="w")
 
         self.zoom_enabled = tk.BooleanVar(value=False)
-        ttk.Checkbutton(side, text="Enable zoom before recognition", variable=self.zoom_enabled, command=self.push_controls).grid(row=13, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(side, text="Enable zoom before recognition", variable=self.zoom_enabled, command=self.toggle_zoom).grid(row=13, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
         self.zoom_factor = tk.DoubleVar(value=1.0)
         ttk.Label(side, text="Zoom factor", style="Card.TLabel").grid(row=14, column=0, sticky="w", pady=(10, 0))
-        ttk.Scale(side, from_=1.0, to=8.0, variable=self.zoom_factor, command=lambda _v: self.push_controls()).grid(row=15, column=0, columnspan=3, sticky="ew")
+        self.zoom_status_var = tk.StringVar(value="Zoom OFF")
+        ttk.Label(side, textvariable=self.zoom_status_var, style="Card.TLabel").grid(row=14, column=1, columnspan=2, sticky="e", pady=(10, 0))
+        ttk.Scale(side, from_=1.0, to=8.0, variable=self.zoom_factor, command=lambda _v: self.on_zoom_factor_changed()).grid(row=15, column=0, columnspan=3, sticky="ew")
 
         self.zoom_x = tk.DoubleVar(value=0.5)
         self.zoom_y = tk.DoubleVar(value=0.5)
@@ -983,11 +1161,40 @@ class DesktopStationApp(tk.Tk):
         self.start_btn.configure(state=tk.NORMAL)
         self.stop_btn.configure(state=tk.DISABLED)
 
+    def _effective_zoom_enabled(self) -> bool:
+        return bool(self.zoom_enabled.get()) and float(self.zoom_factor.get()) > 1.001
+
+    def _refresh_zoom_status_label(self) -> None:
+        if not hasattr(self, "zoom_status_var"):
+            return
+        if self._effective_zoom_enabled():
+            self.zoom_status_var.set(
+                f"Zoom {float(self.zoom_factor.get()):.2f}x @ "
+                f"{float(self.zoom_x.get()):.2f},{float(self.zoom_y.get()):.2f}"
+            )
+        else:
+            self.zoom_status_var.set("Zoom OFF")
+
+    def toggle_zoom(self) -> None:
+        if self.zoom_enabled.get() and float(self.zoom_factor.get()) <= 1.001:
+            # Checking the box should visibly change the image immediately.
+            self.zoom_factor.set(2.0)
+        self.push_controls()
+
+    def on_zoom_factor_changed(self) -> None:
+        # Moving the zoom slider above 1x automatically enables zoom.
+        # Moving it back to 1x turns zoom off.
+        self.zoom_enabled.set(float(self.zoom_factor.get()) > 1.001)
+        self.push_controls()
+
     def push_controls(self) -> None:
+        zoom_factor = float(self.zoom_factor.get())
+        zoom_enabled = bool(self.zoom_enabled.get()) and zoom_factor > 1.001
+        self._refresh_zoom_status_label()
         if self.worker:
             self.worker.update_controls(
-                zoom_enabled=bool(self.zoom_enabled.get()),
-                zoom_factor=float(self.zoom_factor.get()),
+                zoom_enabled=zoom_enabled,
+                zoom_factor=zoom_factor,
                 zoom_center_x=float(self.zoom_x.get()),
                 zoom_center_y=float(self.zoom_y.get()),
                 draw_unknown=bool(self.draw_unknown.get()),
@@ -995,11 +1202,16 @@ class DesktopStationApp(tk.Tk):
             )
 
     def pan_zoom(self, dx: float, dy: float) -> None:
+        if float(self.zoom_factor.get()) <= 1.001:
+            self.zoom_factor.set(2.0)
+        self.zoom_enabled.set(True)
+        # Fixed pan step. This moves the crop center enough to be visible on network streams.
         self.zoom_x.set(min(1.0, max(0.0, self.zoom_x.get() + dx)))
         self.zoom_y.set(min(1.0, max(0.0, self.zoom_y.get() + dy)))
         self.push_controls()
 
     def reset_zoom(self) -> None:
+        self.zoom_enabled.set(False)
         self.zoom_factor.set(1.0)
         self.zoom_x.set(0.5)
         self.zoom_y.set(0.5)
