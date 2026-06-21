@@ -1,0 +1,14 @@
+{
+  "moodle_base_url": "https://192.168.0.154",
+  "cmid": 18,
+  "api_secret": "CHANGE_ME_USE_LONG_RANDOM_SECRET_FROM_MOODLE",
+  "verify_tls": true,
+  "camera_index": 0,
+  "profile": "fast_short",
+  "source": "camera-lab-1",
+  "refresh_seconds": 30,
+  "unknown_cooldown_seconds": 15,
+  "http_timeout_seconds": 10,
+  "station_id": "camera-lab-1",
+  "station_private_key_path": "station_private_key.b64"
+}
