@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "updated_at": "2026-06-21 23:41:03",
+  "capture_every": 10,
+  "match_threshold": 0.5,
+  "next_number": 2,
+  "tracks": []
+}
